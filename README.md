@@ -18,7 +18,7 @@ zip -r TransformCSV.zip TransformCSV.py pymysql/
 zip -r LoadCSV.zip LoadCSV.py pymysql/
 zip -r QueryDB.zip QueryDB.py pymysql/
 ```
-# Create Lambda functions (repeat for each)
+### Create Lambda functions (repeat for each)
 
 ### 4. Set Environment Variables for LoadCSV and QueryDB
 {DB_HOST=your-endpoint,DB_USER=admin,DB_PASSWORD=yourpass,DB_NAME=SALES}
@@ -42,3 +42,4 @@ Replace these with your values:
 ```bash
 ./test/callservice.sh
 ```
+
