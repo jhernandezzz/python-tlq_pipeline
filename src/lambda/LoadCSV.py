@@ -15,6 +15,8 @@ def lambda_handler(event, context):
     """
     Lambda handler to load transformed CSV from S3 into Aurora MySQL.
 
+    UPDATED: Now uses TRUNCATE to overwrite old data and batch inserts for performance.
+
     Expected event structure:
     {
         "bucketname": "your-bucket-name",
@@ -40,14 +42,13 @@ def lambda_handler(event, context):
 
     try:
         # ---------- 1. Load DB properties from environment variables ----------
-        # Set these as Lambda environment variables or use AWS Secrets Manager
-
-        # Note: For production, use environment variables or AWS Secrets Manager:
-        # import os
         db_host = os.environ.get('DB_HOST')
         db_user = os.environ.get('DB_USER')
         db_password = os.environ.get('DB_PASSWORD')
         db_name = os.environ.get('DB_NAME', 'SALES')
+
+        if not db_host or not db_user or not db_password:
+            raise ValueError("Missing required environment variables: DB_HOST, DB_USER, or DB_PASSWORD")
 
         # ---------- 2. Connect to Aurora MySQL ----------
         connection = pymysql.connect(
@@ -55,7 +56,8 @@ def lambda_handler(event, context):
             user=db_user,
             password=db_password,
             database=db_name,
-            connect_timeout=5
+            connect_timeout=5,
+            autocommit=False  # Manual transaction control for performance
         )
         logger.info(f"Connected to Aurora MySQL at {db_host}")
 
@@ -87,9 +89,17 @@ def lambda_handler(event, context):
 
         logger.info("Ensured table SALES.sales exists.")
 
+        # ---------- 3b. OVERWRITE OLD DATA ----------
+        # Clear old rows so DB matches the current CSV exactly
+        with connection.cursor() as cursor:
+            cursor.execute("TRUNCATE TABLE sales")
+            connection.commit()
+            logger.info("TRUNCATE TABLE sales executed. Old data removed.")
+
         # ---------- 4. Prepare insert statement ----------
+        # Simple INSERT (no IGNORE) because duplicates within the file should not exist
         insert_sql = """
-        INSERT IGNORE INTO sales (
+        INSERT INTO sales (
             order_id, region, country, item_type, sales_channel, order_priority,
             order_date, ship_date, units_sold, unit_price, unit_cost,
             total_revenue, total_cost, total_profit, order_processing_time, gross_margin
@@ -120,7 +130,12 @@ def lambda_handler(event, context):
             if col not in fieldnames:
                 logger.warning(f"WARNING: header '{col}' not found in CSV. Check TransformCSV output.")
 
-        # ---------- 7. Read and insert each row ----------
+        logger.info("Starting to process rows with batch inserts...")
+
+        # ---------- 7. Read and insert each row (BATCHED) ----------
+        BATCH_SIZE = 1000
+        batch = []
+
         with connection.cursor() as cursor:
             for row in csv_reader:
                 if not row or all(v.strip() == '' for v in row.values()):
@@ -154,22 +169,31 @@ def lambda_handler(event, context):
                     order_proc_time = int(row.get('Order Processing Time', '0'))
                     gross_margin = float(row.get('Gross Margin', '0'))
 
-                    # Execute insert
-                    cursor.execute(insert_sql, (
+                    # Add to batch
+                    batch.append((
                         order_id, region, country, item_type, sales_channel, order_priority,
                         order_date, ship_date, units_sold, unit_price, unit_cost,
                         total_revenue, total_cost, total_profit, order_proc_time, gross_margin
                     ))
 
-                    if cursor.rowcount > 0:
-                        rows_inserted += 1
+                    # Execute batch when it reaches BATCH_SIZE
+                    if len(batch) >= BATCH_SIZE:
+                        cursor.executemany(insert_sql, batch)
+                        connection.commit()
+                        rows_inserted += len(batch)
+                        logger.info(f"Inserted batch of {len(batch)} rows. Total: {rows_inserted}")
+                        batch = []
 
                 except Exception as row_ex:
                     logger.error(f"Error parsing/inserting row: {row}")
                     logger.error(f"Row exception: {str(row_ex)}")
 
-            # Commit all inserts
-            connection.commit()
+            # Execute any remaining batch
+            if batch:
+                cursor.executemany(insert_sql, batch)
+                connection.commit()
+                rows_inserted += len(batch)
+                logger.info(f"Inserted final batch of {len(batch)} rows. Total: {rows_inserted}")
 
         summary = f"LoadCSV complete. rowsRead={rows_read}, rowsInserted={rows_inserted}"
         logger.info(summary)
@@ -181,6 +205,14 @@ def lambda_handler(event, context):
         }
 
     except Exception as e:
+        # If anything goes wrong, try to roll back the transaction
+        if connection:
+            try:
+                connection.rollback()
+                logger.info("Transaction rolled back due to error")
+            except Exception:
+                pass
+
         logger.error(f"LoadCSV ERROR: {str(e)}")
         response['statusCode'] = 500
         response['body'] = {
@@ -189,6 +221,9 @@ def lambda_handler(event, context):
 
     finally:
         if connection:
-            connection.close()
+            try:
+                connection.close()
+            except Exception:
+                pass
 
     return response
